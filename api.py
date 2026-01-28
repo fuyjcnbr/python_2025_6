@@ -70,7 +70,7 @@ class BaseClass(object):
         attr_name = self._attr_name_of_protected(self._protected_attr_name)
         if (self.required or not self.nullable) and value is None:
             raise AbsentRequiredFieldException(f"{instance.__class__.__name__}: absent required field '{attr_name}'")
-        if value:
+        if value is not None:
             b, msg = self.validate(value)
             if not b:
                 raise WrongFieldContent(f"{instance.__class__.__name__}: wrong field content '{attr_name}': {msg}")
@@ -102,7 +102,13 @@ class PhoneField(BaseClass):
 
 
 class DateField(BaseClass):
-    pass
+
+    def validate(self, value) -> (bool, str):
+        try:
+            d0 = datetime.datetime.strptime(value, "%d.%m.%Y")
+        except Exception as e:
+            return False, "should be string in format %d.%m.%Y"
+        return True, ""
 
 
 class BirthDayField(BaseClass):
@@ -126,7 +132,16 @@ class GenderField(BaseClass):
 
 
 class ClientIDsField(BaseClass):
-    pass
+
+    def validate(self, value) -> (bool, str):
+        if not isinstance(value, list):
+            return False, "should be list"
+        if len(value) == 0:
+            return False, "should be non empty list"
+        for x in value:
+            if not isinstance(x, int):
+                return False, "should be list of ints"
+        return True, ""
 
 
 class BaseClass2(object):
@@ -152,6 +167,26 @@ class BaseClass2(object):
                             d[k2] = v2
         return cls.of_dict(d)
 
+    @classmethod
+    def of_request_arguments(cls, arg: dict):
+        d = {}
+        for k, v in arg.items():
+            d[k] = v
+            if isinstance(v, dict):
+                for k2, v2 in v.items():
+                        d[k2] = v2
+        return cls.of_dict(d)
+
+    def get_list_of_nonempty_fields(self) -> list[str]:
+        cls = self.__class__
+        properties = [a[0] for a in inspect.getmembers(cls, lambda x: isinstance(x, property))]
+        li = []
+        for k, v in cls.__dict__.items():
+            if k[:2] != "__" and k not in properties:
+                if getattr(self, k) is not None:
+                    li.append(k)
+        return li
+
 
 class ClientsInterestsRequest(BaseClass2):
     client_ids = ClientIDsField(required=True)
@@ -159,19 +194,13 @@ class ClientsInterestsRequest(BaseClass2):
 
 
 class OnlineScoreRequest(BaseClass2):
-    # first_name = CharField(required=False, nullable=True)
-    # last_name = CharField(required=False, nullable=True)
-    # email = EmailField(required=False, nullable=True)
-    # phone = PhoneField(required=False, nullable=True)
-    # birthday = BirthDayField(required=False, nullable=True)
-    # gender = GenderField(required=False, nullable=True)
-
     first_name = CharField(required=False, nullable=True)
     last_name = CharField(required=False, nullable=True)
-    email = EmailField(required=True, nullable=True)
-    phone = PhoneField(required=True, nullable=True)
+    email = EmailField(required=False, nullable=True)
+    phone = PhoneField(required=False, nullable=True)
     birthday = BirthDayField(required=False, nullable=True)
     gender = GenderField(required=False, nullable=True)
+
 
 class MethodRequest(BaseClass2):
     account = CharField(required=False, nullable=True)
@@ -194,8 +223,6 @@ def check_auth(request):
 
 
 def method_handler(request, ctx, store):
-    print(f"request={request}")
-    # print(f"type(request) = {type(request)}")
     if not request:
         return None, FORBIDDEN
 
@@ -205,7 +232,7 @@ def method_handler(request, ctx, store):
     try:
         data_method = MethodRequest.of_request(request)
     except AbsentRequiredFieldException as e:
-        print(e)
+        logging.info(e)
         return {"msg": str(e)}, INVALID_REQUEST #FORBIDDEN
 
     if not check_auth(data_method):
@@ -214,12 +241,12 @@ def method_handler(request, ctx, store):
 
     if data_method.method == "online_score":
         try:
-            data = OnlineScoreRequest.of_request(request)
+            data = OnlineScoreRequest.of_request_arguments(request["body"]["arguments"])
         except AbsentRequiredFieldException as e:
-            print(e)
+            logging.info(e)
             return {"msg": str(e)}, INVALID_REQUEST
         except WrongFieldContent as e:
-            print(e)
+            logging.info(e)
             return {"msg": str(e)}, INVALID_REQUEST
 
         if data_method.is_admin:
@@ -234,39 +261,22 @@ def method_handler(request, ctx, store):
                 first_name=data.first_name,
                 last_name=data.last_name,
             )
+        ctx["has"] = data.get_list_of_nonempty_fields()
         return {"score": score}, OK
     elif data_method.method == "clients_interests":
-        data = ClientsInterestsRequest.of_request(request)
-
-
-
-
-    # try:
-    #     # print(f"method_handler in try")
-    #     if "method" not in request["body"].keys():
-    #         data = MethodRequest.of_request(request)
-    #     elif request["body"]["method"] == "online_score":
-    #         # print(f"method_handler in score")
-    #         data = OnlineScoreRequest.of_request(request)
-    #         score = scoring.get_score(
-    #             store=None,
-    #             phone=data.phone,
-    #             email=data.email,
-    #             birthday=data.birthday,
-    #             gender=data.gender,
-    #             first_name=data.first_name,
-    #             last_name=data.last_name,
-    #         )
-    #         return {"score": score}, OK
-    #     elif request["body"]["method"] == "clients_interests":
-    #         data = ClientsInterestsRequest.of_request(request)
-    #     else:
-    #         data = MethodRequest.of_request(request)
-    # except AbsentRequiredFieldException as e:
-    #     return {"msg": str(e)}, INVALID_REQUEST
-
-
-
+        try:
+            data = ClientsInterestsRequest.of_request_arguments(request["body"]["arguments"])
+            ctx["nclients"] = len(data.client_ids)
+            response = {}
+            for client_id in data.client_ids:
+                response[str(client_id)] = scoring.get_interests(store, client_id)
+            return response, OK
+        except AbsentRequiredFieldException as e:
+            logging.info(e)
+            return {"msg": str(e)}, INVALID_REQUEST
+        except WrongFieldContent as e:
+            logging.info(e)
+            return {"msg": str(e)}, INVALID_REQUEST
     response, code = None, OK
     return response, code
 
